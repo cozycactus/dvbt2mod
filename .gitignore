@@ -1,0 +1,6 @@
+/build/
+/.cache/
+__pycache__/
+*.pyc
+*.cf32
+*.ts
