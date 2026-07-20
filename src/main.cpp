@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#endif
+
 #include <gnuradio/blocks/head.h>
 #include <gnuradio/blocks/null_sink.h>
 #include <gnuradio/digital/ofdm_cyclic_prefixer.h>
@@ -20,6 +32,7 @@
 #include <gnuradio/dtv/dvbt2_pilotgenerator_cc.h>
 #include <gnuradio/gr_complex.h>
 #include <gnuradio/io_signature.h>
+#include <gnuradio/logger.h>
 #include <gnuradio/sync_block.h>
 #include <gnuradio/top_block.h>
 
@@ -30,6 +43,8 @@
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -41,22 +56,510 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <fcntl.h>
+#if defined(_WIN32)
+#include <io.h>
+#include <sys/stat.h>
+#include <windows.h>
+#else
 #include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 namespace dtv = gr::dtv;
 
 namespace {
+
+namespace platform {
+
+fs::path path_from_utf8(const std::string& path)
+{
+#if defined(_WIN32)
+    return fs::u8path(path);
+#else
+    return fs::path(path);
+#endif
+}
+
+#if defined(_WIN32)
+
+int duplicate_standard_stream(DWORD standard_handle_id, int access_mode)
+{
+    const HANDLE standard_handle = ::GetStdHandle(standard_handle_id);
+    if (standard_handle == nullptr || standard_handle == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+
+    HANDLE duplicate_handle = nullptr;
+    if (::DuplicateHandle(::GetCurrentProcess(),
+                          standard_handle,
+                          ::GetCurrentProcess(),
+                          &duplicate_handle,
+                          0,
+                          FALSE,
+                          DUPLICATE_SAME_ACCESS) == 0) {
+        errno = EIO;
+        return -1;
+    }
+
+    if (access_mode == _O_WRONLY &&
+        ::GetFileType(duplicate_handle) == FILE_TYPE_PIPE) {
+        DWORD pipe_mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        if (::SetNamedPipeHandleState(
+                duplicate_handle, &pipe_mode, nullptr, nullptr) == 0) {
+            ::CloseHandle(duplicate_handle);
+            errno = EIO;
+            return -1;
+        }
+    }
+
+    // Adopt an independently owned copy of the actual Win32 standard HANDLE.
+    // The descriptor is binary for the few CRT operations that own its lifetime;
+    // payload I/O below still goes directly through ReadFile/WriteFile.
+    const int duplicate = ::_open_osfhandle(
+        reinterpret_cast<intptr_t>(duplicate_handle), access_mode | _O_BINARY);
+    if (duplicate < 0) {
+        const int saved_errno = errno;
+        ::CloseHandle(duplicate_handle);
+        errno = saved_errno;
+        return -1;
+    }
+    return duplicate;
+}
+
+int duplicate_stdin()
+{
+    return duplicate_standard_stream(STD_INPUT_HANDLE, _O_RDONLY);
+}
+
+int duplicate_stdout()
+{
+    return duplicate_standard_stream(STD_OUTPUT_HANDLE, _O_WRONLY);
+}
+
+int open_input(const std::string& path)
+{
+    return ::_wopen(path_from_utf8(path).c_str(), _O_RDONLY | _O_BINARY);
+}
+
+int open_output(const std::string& path, bool overwrite)
+{
+    // In overwrite mode truncation is deliberately deferred until the opened
+    // INPUT and OUTPUT handles have been compared for identity.
+    const int flags =
+        _O_WRONLY | _O_CREAT | _O_BINARY | (overwrite ? 0 : _O_EXCL);
+    return ::_wopen(path_from_utf8(path).c_str(),
+                    flags,
+                    _S_IREAD | _S_IWRITE);
+}
+
+int close_fd(int fd) { return ::_close(fd); }
+
+HANDLE native_handle(int fd) noexcept;
+
+std::ptrdiff_t read_fd(int fd, void* buffer, std::size_t bytes)
+{
+    const HANDLE handle = native_handle(fd);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    const auto count = static_cast<DWORD>(
+        std::min<std::size_t>(bytes, std::numeric_limits<DWORD>::max()));
+    DWORD bytes_to_read = count;
+    if (::GetFileType(handle) == FILE_TYPE_PIPE) {
+        DWORD available = 0;
+        if (::PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) == 0) {
+            const DWORD error = ::GetLastError();
+            if (error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA ||
+                error == ERROR_PIPE_NOT_CONNECTED) {
+                return 0;
+            }
+            errno = EIO;
+            return -1;
+        }
+        if (available == 0) {
+            ::Sleep(1);
+            errno = EAGAIN;
+            return -1;
+        }
+        bytes_to_read = std::min(count, available);
+    }
+    DWORD transferred = 0;
+    if (::ReadFile(handle, buffer, bytes_to_read, &transferred, nullptr) != 0) {
+        return static_cast<std::ptrdiff_t>(transferred);
+    }
+    const DWORD error = ::GetLastError();
+    if (error == ERROR_MORE_DATA && transferred != 0) {
+        return static_cast<std::ptrdiff_t>(transferred);
+    }
+    if (error == ERROR_BROKEN_PIPE || error == ERROR_HANDLE_EOF ||
+        error == ERROR_NO_DATA) {
+        return 0;
+    }
+    errno = error == ERROR_OPERATION_ABORTED ? EINTR : EIO;
+    return -1;
+}
+
+std::ptrdiff_t write_fd(int fd, const void* buffer, std::size_t bytes)
+{
+    const HANDLE handle = native_handle(fd);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    const auto count = static_cast<DWORD>(
+        std::min<std::size_t>(bytes, std::numeric_limits<DWORD>::max()));
+    DWORD transferred = 0;
+    if (::WriteFile(handle, buffer, count, &transferred, nullptr) != 0) {
+        if (transferred == 0 && count != 0 &&
+            ::GetFileType(handle) == FILE_TYPE_PIPE) {
+            ::Sleep(1);
+            errno = EAGAIN;
+            return -1;
+        }
+        return static_cast<std::ptrdiff_t>(transferred);
+    }
+    const DWORD error = ::GetLastError();
+    if (error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA ||
+        error == ERROR_PIPE_NOT_CONNECTED) {
+        errno = EPIPE;
+    } else if (error == ERROR_OPERATION_ABORTED) {
+        errno = EINTR;
+    } else {
+        errno = EIO;
+    }
+    return -1;
+}
+
+bool rewind_fd(int fd) { return ::_lseeki64(fd, 0, SEEK_SET) >= 0; }
+
+HANDLE native_handle(int fd) noexcept
+{
+    const intptr_t value = ::_get_osfhandle(fd);
+    return value == -1 ? INVALID_HANDLE_VALUE : reinterpret_cast<HANDLE>(value);
+}
+
+bool same_open_file(int first_fd, int second_fd)
+{
+    const HANDLE first_handle = native_handle(first_fd);
+    const HANDLE second_handle = native_handle(second_fd);
+    if (first_handle == INVALID_HANDLE_VALUE || second_handle == INVALID_HANDLE_VALUE) {
+        throw std::system_error(EBADF,
+                                std::generic_category(),
+                                "get native INPUT/OUTPUT handles");
+    }
+    ::SetLastError(NO_ERROR);
+    const DWORD first_type = ::GetFileType(first_handle);
+    const DWORD first_type_error = ::GetLastError();
+    ::SetLastError(NO_ERROR);
+    const DWORD second_type = ::GetFileType(second_handle);
+    const DWORD second_type_error = ::GetLastError();
+    if ((first_type == FILE_TYPE_UNKNOWN && first_type_error != NO_ERROR) ||
+        (second_type == FILE_TYPE_UNKNOWN && second_type_error != NO_ERROR)) {
+        throw std::system_error(
+            static_cast<int>(first_type == FILE_TYPE_UNKNOWN ? first_type_error
+                                                             : second_type_error),
+            std::system_category(),
+            "identify opened INPUT/OUTPUT handles");
+    }
+    if (first_type != FILE_TYPE_DISK || second_type != FILE_TYPE_DISK) {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION first {};
+    BY_HANDLE_FILE_INFORMATION second {};
+    if (::GetFileInformationByHandle(first_handle, &first) == 0 ||
+        ::GetFileInformationByHandle(second_handle, &second) == 0) {
+        throw std::system_error(static_cast<int>(::GetLastError()),
+                                std::system_category(),
+                                "identify opened INPUT/OUTPUT files");
+    }
+    return first.dwVolumeSerialNumber == second.dwVolumeSerialNumber &&
+           first.nFileIndexHigh == second.nFileIndexHigh &&
+           first.nFileIndexLow == second.nFileIndexLow;
+}
+
+int truncate_fd(int fd) noexcept
+{
+    const errno_t result = ::_chsize_s(fd, 0);
+    if (result != 0) {
+        errno = result;
+        return -1;
+    }
+    return ::_lseeki64(fd, 0, SEEK_SET) < 0 ? -1 : 0;
+}
+
+std::size_t preferred_write_size(int fd)
+{
+    struct _stat64 status {};
+    if (::_fstat64(fd, &status) == 0 &&
+        (status.st_mode & _S_IFMT) == _S_IFREG) {
+        return 64 * 1024;
+    }
+    // Keep individual synchronous writes to redirected stdout small. They are
+    // cancellable below, but a small chunk also limits pipe latency.
+    return 4 * 1024;
+}
+
+bool stdin_refers_to_file(const std::string& path)
+{
+    const intptr_t stdin_handle_value = ::_get_osfhandle(::_fileno(stdin));
+    if (stdin_handle_value == -1) return false;
+    const HANDLE stdin_handle = reinterpret_cast<HANDLE>(stdin_handle_value);
+
+    const fs::path native_path = path_from_utf8(path);
+    const HANDLE output_handle = ::CreateFileW(native_path.c_str(),
+                                                FILE_READ_ATTRIBUTES,
+                                                FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                                    FILE_SHARE_DELETE,
+                                                nullptr,
+                                                OPEN_EXISTING,
+                                                FILE_ATTRIBUTE_NORMAL,
+                                                nullptr);
+    if (output_handle != INVALID_HANDLE_VALUE) {
+        BY_HANDLE_FILE_INFORMATION input_info {};
+        BY_HANDLE_FILE_INFORMATION output_info {};
+        const bool have_identity =
+            ::GetFileInformationByHandle(stdin_handle, &input_info) != 0 &&
+            ::GetFileInformationByHandle(output_handle, &output_info) != 0;
+        ::CloseHandle(output_handle);
+        if (have_identity) {
+            return input_info.dwVolumeSerialNumber ==
+                       output_info.dwVolumeSerialNumber &&
+                   input_info.nFileIndexHigh == output_info.nFileIndexHigh &&
+                   input_info.nFileIndexLow == output_info.nFileIndexLow;
+        }
+    }
+
+    // Attribute-only CreateFile can still be denied by another handle's share
+    // mode. In that case compare the final path already attached to stdin.
+    const DWORD required = ::GetFinalPathNameByHandleW(
+        stdin_handle, nullptr, 0, FILE_NAME_NORMALIZED);
+    if (required == 0) return false;
+    std::vector<wchar_t> input_path(static_cast<std::size_t>(required) + 1);
+    const DWORD length = ::GetFinalPathNameByHandleW(stdin_handle,
+                                                     input_path.data(),
+                                                     static_cast<DWORD>(input_path.size()),
+                                                     FILE_NAME_NORMALIZED);
+    if (length == 0 || length >= input_path.size()) return false;
+    std::error_code ec;
+    return fs::equivalent(fs::path(input_path.data()), native_path, ec) && !ec;
+}
+
+std::string utf8_from_wide(const wchar_t* text)
+{
+    if (text == nullptr) return {};
+    const int bytes = ::WideCharToMultiByte(CP_UTF8,
+                                            WC_ERR_INVALID_CHARS,
+                                            text,
+                                            -1,
+                                            nullptr,
+                                            0,
+                                            nullptr,
+                                            nullptr);
+    if (bytes <= 0) {
+        throw std::runtime_error("cannot convert a command-line argument to UTF-8");
+    }
+    std::string result(static_cast<std::size_t>(bytes), '\0');
+    if (::WideCharToMultiByte(CP_UTF8,
+                              WC_ERR_INVALID_CHARS,
+                              text,
+                              -1,
+                              result.data(),
+                              bytes,
+                              nullptr,
+                              nullptr) <= 0) {
+        throw std::runtime_error("cannot convert a command-line argument to UTF-8");
+    }
+    result.pop_back();
+    return result;
+}
+
+class cancellable_io
+{
+public:
+    class operation
+    {
+    public:
+        explicit operation(cancellable_io& owner) : owner_(owner) { owner_.begin(); }
+        ~operation() { owner_.end(); }
+
+        operation(const operation&) = delete;
+        operation& operator=(const operation&) = delete;
+
+    private:
+        cancellable_io& owner_;
+    };
+
+    ~cancellable_io()
+    {
+        const HANDLE handle = thread_handle_.load(std::memory_order_acquire);
+        if (handle != nullptr) ::CloseHandle(handle);
+    }
+
+    void begin()
+    {
+        if (thread_handle_.load(std::memory_order_acquire) == nullptr) {
+            HANDLE duplicate = nullptr;
+            if (::DuplicateHandle(::GetCurrentProcess(),
+                                  ::GetCurrentThread(),
+                                  ::GetCurrentProcess(),
+                                  &duplicate,
+                                  0,
+                                  FALSE,
+                                  DUPLICATE_SAME_ACCESS) == 0) {
+                throw std::system_error(static_cast<int>(::GetLastError()),
+                                        std::system_category(),
+                                        "DuplicateHandle(I/O thread)");
+            }
+            HANDLE expected = nullptr;
+            if (!thread_handle_.compare_exchange_strong(
+                    expected, duplicate, std::memory_order_acq_rel)) {
+                ::CloseHandle(duplicate);
+            }
+        }
+        active_.store(true, std::memory_order_release);
+    }
+
+    void end() noexcept { active_.store(false, std::memory_order_release); }
+
+    std::uint32_t cancel(int fd) noexcept
+    {
+        const HANDLE handle = thread_handle_.load(std::memory_order_acquire);
+        const HANDLE file_handle = fd >= 0 ? native_handle(fd) : INVALID_HANDLE_VALUE;
+        if (handle == nullptr || file_handle == INVALID_HANDLE_VALUE) {
+            return active_.load(std::memory_order_acquire) ? ERROR_INVALID_HANDLE
+                                                          : ERROR_SUCCESS;
+        }
+        while (active_.load(std::memory_order_acquire)) {
+            if (::CancelSynchronousIo(handle) != 0) return ERROR_SUCCESS;
+            const DWORD thread_error = ::GetLastError();
+
+            // CancelIoEx targets the actual descriptor handle and is a
+            // fallback if thread-targeted cancellation is unavailable.
+            if (::CancelIoEx(file_handle, nullptr) != 0) return ERROR_SUCCESS;
+            const DWORD file_error = ::GetLastError();
+
+            if (!active_.load(std::memory_order_acquire)) return ERROR_SUCCESS;
+            // ERROR_NOT_FOUND from both APIs is the narrow transition where
+            // begin() is visible but the CRT has not entered ReadFile/WriteFile
+            // yet. Yield until either the worker observes stop or I/O exists to
+            // cancel. Any persistent API error is returned instead of spun on.
+            if (thread_error != ERROR_NOT_FOUND || file_error != ERROR_NOT_FOUND) {
+                return thread_error != ERROR_NOT_FOUND ? thread_error : file_error;
+            }
+            ::Sleep(1);
+        }
+        return ERROR_SUCCESS;
+    }
+
+private:
+    std::atomic<HANDLE> thread_handle_{ nullptr };
+    std::atomic<bool> active_{ false };
+};
+
+#else
+
+int duplicate_stdin() { return ::dup(STDIN_FILENO); }
+int duplicate_stdout() { return ::dup(STDOUT_FILENO); }
+int open_input(const std::string& path) { return ::open(path.c_str(), O_RDONLY); }
+
+int open_output(const std::string& path, bool overwrite)
+{
+    // In overwrite mode truncation is deliberately deferred until the opened
+    // INPUT and OUTPUT descriptors have been compared for identity.
+    const int flags = O_WRONLY | O_CREAT | (overwrite ? 0 : O_EXCL);
+    return ::open(path.c_str(), flags, 0666);
+}
+
+int close_fd(int fd) { return ::close(fd); }
+
+std::ptrdiff_t read_fd(int fd, void* buffer, std::size_t bytes)
+{
+    return static_cast<std::ptrdiff_t>(::read(fd, buffer, bytes));
+}
+
+std::ptrdiff_t write_fd(int fd, const void* buffer, std::size_t bytes)
+{
+    return static_cast<std::ptrdiff_t>(::write(fd, buffer, bytes));
+}
+
+bool rewind_fd(int fd) { return ::lseek(fd, 0, SEEK_SET) >= 0; }
+
+bool same_open_file(int first_fd, int second_fd)
+{
+    struct stat first {};
+    struct stat second {};
+    if (::fstat(first_fd, &first) != 0 || ::fstat(second_fd, &second) != 0) {
+        throw std::system_error(errno,
+                                std::generic_category(),
+                                "identify opened INPUT/OUTPUT files");
+    }
+    return S_ISREG(first.st_mode) && S_ISREG(second.st_mode) &&
+           first.st_dev == second.st_dev && first.st_ino == second.st_ino;
+}
+
+int truncate_fd(int fd) noexcept
+{
+    if (::ftruncate(fd, 0) != 0) return -1;
+    return ::lseek(fd, 0, SEEK_SET) < 0 ? -1 : 0;
+}
+
+std::size_t preferred_write_size(int fd)
+{
+    struct stat status {};
+    if (::fstat(fd, &status) == 0 && S_ISREG(status.st_mode)) return 64 * 1024;
+    const long pipe_buf = ::fpathconf(fd, _PC_PIPE_BUF);
+    return pipe_buf > 0 ? static_cast<std::size_t>(pipe_buf) : 512;
+}
+
+bool stdin_refers_to_file(const std::string& path)
+{
+    struct stat input_status {};
+    struct stat output_status {};
+    return ::fstat(STDIN_FILENO, &input_status) == 0 &&
+           ::stat(path.c_str(), &output_status) == 0 &&
+           S_ISREG(input_status.st_mode) &&
+           input_status.st_dev == output_status.st_dev &&
+           input_status.st_ino == output_status.st_ino;
+}
+
+class cancellable_io
+{
+public:
+    class operation
+    {
+    public:
+        explicit operation(cancellable_io& owner) : owner_(owner) { owner_.begin(); }
+        ~operation() { owner_.end(); }
+
+        operation(const operation&) = delete;
+        operation& operator=(const operation&) = delete;
+
+    private:
+        cancellable_io& owner_;
+    };
+
+    void begin() {}
+    void end() noexcept {}
+    std::uint32_t cancel(int) noexcept { return 0; }
+};
+
+#endif
+
+} // namespace platform
 
 static_assert(sizeof(gr_complex) == 2 * sizeof(float),
               "dvbt2mod requires packed complex float samples");
@@ -107,23 +610,29 @@ public:
     void capture_current_exception()
     {
         std::exception_ptr current = std::current_exception();
-        bool expected = false;
-        if (failed_.compare_exchange_strong(expected,
-                                            true,
-                                            std::memory_order_acq_rel)) {
-            error_ = std::move(current);
-        }
+        if (!current) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (error_) return;
+        error_ = std::move(current);
+        failed_.store(true, std::memory_order_release);
     }
 
     bool failed() const { return failed_.load(std::memory_order_acquire); }
 
     void rethrow_if_failed() const
     {
-        if (failed() && error_) std::rethrow_exception(error_);
+        if (!failed()) return;
+        std::exception_ptr error;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            error = error_;
+        }
+        if (error) std::rethrow_exception(error);
     }
 
 private:
     std::atomic<bool> failed_{ false };
+    mutable std::mutex mutex_;
     std::exception_ptr error_;
 };
 
@@ -163,7 +672,7 @@ public:
           poll_input_(path == "-"),
           error_state_(std::move(error_state))
     {
-        fd_ = poll_input_ ? ::dup(STDIN_FILENO) : ::open(path.c_str(), O_RDONLY);
+        fd_ = poll_input_ ? platform::duplicate_stdin() : platform::open_input(path);
         if (fd_ < 0) {
             throw std::system_error(errno,
                                     std::generic_category(),
@@ -178,15 +687,26 @@ public:
 
     ~ts_packet_source() override
     {
-        if (fd_ >= 0) ::close(fd_);
+        if (fd_ >= 0) platform::close_fd(fd_);
     }
 
     std::uint64_t input_packets() const { return input_packets_; }
     std::uint64_t padding_bytes() const { return padding_bytes_; }
+    int file_descriptor() const { return fd_; }
 
     bool stop() override
     {
         stop_requested_.store(true, std::memory_order_release);
+        const std::uint32_t cancel_error = cancellable_io_.cancel(fd_);
+        if (cancel_error != 0) {
+            try {
+                throw std::system_error(static_cast<int>(cancel_error),
+                                        std::system_category(),
+                                        "cancel(input I/O)");
+            } catch (...) {
+                error_state_->capture_current_exception();
+            }
+        }
         return true;
     }
 
@@ -255,6 +775,7 @@ private:
     load_result load_packet()
     {
         while (packet_fill_ < packet_.size()) {
+#if !defined(_WIN32)
             if (poll_input_) {
                 pollfd descriptor{ fd_, POLLIN, 0 };
                 const int poll_result = ::poll(&descriptor, 1, 50);
@@ -269,15 +790,26 @@ private:
                     throw std::runtime_error("input file descriptor became invalid");
                 }
             }
+#endif
 
-            const ssize_t bytes = ::read(fd_,
-                                         packet_.data() + packet_fill_,
-                                         packet_.size() - packet_fill_);
+            std::ptrdiff_t bytes = 0;
+            {
+                platform::cancellable_io::operation operation(cancellable_io_);
+                if (stop_requested_.load(std::memory_order_acquire)) {
+                    return load_result::done;
+                }
+                bytes = platform::read_fd(fd_,
+                                          packet_.data() + packet_fill_,
+                                          packet_.size() - packet_fill_);
+            }
             if (bytes > 0) {
                 packet_fill_ += static_cast<std::size_t>(bytes);
                 continue;
             }
             if (bytes < 0) {
+                if (stop_requested_.load(std::memory_order_acquire)) {
+                    return load_result::done;
+                }
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                     return load_result::wait;
                 }
@@ -291,7 +823,7 @@ private:
                     "input ended with an incomplete 188-byte MPEG-TS packet");
             }
             if (repeat_) {
-                if (::lseek(fd_, 0, SEEK_SET) < 0) {
+                if (!platform::rewind_fd(fd_)) {
                     throw std::system_error(errno,
                                             std::generic_category(),
                                             "rewind(input)");
@@ -355,6 +887,7 @@ private:
     std::uint64_t payload_bytes_per_t2_frame_ = 0;
     bool high_efficiency_ = false;
     bool poll_input_ = false;
+    platform::cancellable_io cancellable_io_;
     std::shared_ptr<async_error_state> error_state_;
     std::atomic<bool> stop_requested_{ false };
     std::array<std::uint8_t, 188> packet_{};
@@ -375,15 +908,17 @@ public:
 
     static sptr make(const std::string& path,
                      bool overwrite,
+                     int input_fd,
                      std::shared_ptr<async_error_state> error_state)
     {
         return std::make_shared<interruptible_output_sink>(
-            path, overwrite, std::move(error_state));
+            path, overwrite, input_fd, std::move(error_state));
     }
 
     interruptible_output_sink(
         const std::string& path,
         bool overwrite,
+        int input_fd,
         std::shared_ptr<async_error_state> error_state)
         : gr::sync_block("dvbt2mod_output_sink",
                          gr::io_signature::make(1, 1, sizeof(gr_complex)),
@@ -392,10 +927,9 @@ public:
           error_state_(std::move(error_state))
     {
         if (is_stdout_) {
-            fd_ = ::dup(STDOUT_FILENO);
+            fd_ = platform::duplicate_stdout();
         } else {
-            const int flags = O_WRONLY | O_CREAT | (overwrite ? O_TRUNC : O_EXCL);
-            fd_ = ::open(path.c_str(), flags, 0666);
+            fd_ = platform::open_output(path, overwrite);
         }
         if (fd_ < 0) {
             throw std::system_error(errno,
@@ -403,22 +937,30 @@ public:
                                     is_stdout_ ? "dup(stdout)" : "open(output)");
         }
 
-        struct stat status {};
-        if (::fstat(fd_, &status) == 0 && S_ISREG(status.st_mode)) {
-            max_write_bytes_ = 64 * 1024;
-        } else {
-            const long pipe_buf = ::fpathconf(fd_, _PC_PIPE_BUF);
-            if (pipe_buf > 0) {
-                max_write_bytes_ = static_cast<std::size_t>(pipe_buf);
+        try {
+            if (input_fd >= 0 && platform::same_open_file(input_fd, fd_)) {
+                throw std::runtime_error(
+                    "opened INPUT and OUTPUT refer to the same file");
             }
+            if (!is_stdout_ && overwrite && platform::truncate_fd(fd_) != 0) {
+                throw std::system_error(errno,
+                                        std::generic_category(),
+                                        "truncate(output)");
+            }
+        } catch (...) {
+            platform::close_fd(fd_);
+            fd_ = -1;
+            throw;
         }
+
+        max_write_bytes_ = platform::preferred_write_size(fd_);
         max_write_bytes_ -= max_write_bytes_ % sizeof(gr_complex);
         if (max_write_bytes_ == 0) max_write_bytes_ = sizeof(gr_complex);
     }
 
     ~interruptible_output_sink() override
     {
-        if (fd_ >= 0) ::close(fd_);
+        if (fd_ >= 0) platform::close_fd(fd_);
     }
 
     void close()
@@ -426,7 +968,7 @@ public:
         if (fd_ < 0) return;
         const int descriptor = fd_;
         fd_ = -1;
-        if (::close(descriptor) != 0) {
+        if (platform::close_fd(descriptor) != 0) {
             throw std::system_error(errno,
                                     std::generic_category(),
                                     is_stdout_ ? "close(stdout)" : "close(output)");
@@ -436,6 +978,16 @@ public:
     bool stop() override
     {
         stop_requested_.store(true, std::memory_order_release);
+        const std::uint32_t cancel_error = cancellable_io_.cancel(fd_);
+        if (cancel_error != 0) {
+            try {
+                throw std::system_error(static_cast<int>(cancel_error),
+                                        std::system_category(),
+                                        "cancel(output I/O)");
+            } catch (...) {
+                error_state_->capture_current_exception();
+            }
+        }
         return true;
     }
 
@@ -460,8 +1012,50 @@ private:
     int work_impl(int noutput_items, gr_vector_const_void_star& input_items)
     {
         if (stop_requested_.load(std::memory_order_acquire)) return WORK_DONE;
+        if (noutput_items <= 0) return 0;
 
         const auto* input = static_cast<const std::uint8_t*>(input_items[0]);
+#if defined(_WIN32)
+        const std::size_t item_size = sizeof(gr_complex);
+        const std::size_t available_bytes =
+            static_cast<std::size_t>(noutput_items) * item_size;
+        if (partial_item_bytes_ >= item_size ||
+            partial_item_bytes_ >= available_bytes) {
+            throw std::runtime_error("invalid partial output item state");
+        }
+        const std::size_t bytes_to_write = std::min<std::size_t>(
+            available_bytes - partial_item_bytes_, max_write_bytes_);
+
+        std::ptrdiff_t bytes = 0;
+        {
+            platform::cancellable_io::operation operation(cancellable_io_);
+            if (stop_requested_.load(std::memory_order_acquire)) return WORK_DONE;
+            bytes = platform::write_fd(
+                fd_, input + partial_item_bytes_, bytes_to_write);
+        }
+        if (bytes > 0) {
+            const std::size_t total =
+                partial_item_bytes_ + static_cast<std::size_t>(bytes);
+            const int consumed = static_cast<int>(total / item_size);
+            partial_item_bytes_ = total % item_size;
+            bytes_written_.fetch_add(static_cast<std::uint64_t>(bytes),
+                                     std::memory_order_relaxed);
+            return consumed;
+        }
+        if (bytes < 0 && stop_requested_.load(std::memory_order_acquire)) {
+            return WORK_DONE;
+        }
+        if (bytes < 0 &&
+            (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        }
+        if (bytes < 0) {
+            throw std::system_error(errno,
+                                    std::generic_category(),
+                                    "write(output)");
+        }
+        throw std::runtime_error("write(output) made no progress");
+#else
         const std::size_t bytes_to_write = std::min<std::size_t>(
             static_cast<std::size_t>(noutput_items) * sizeof(gr_complex),
             max_write_bytes_);
@@ -470,6 +1064,7 @@ private:
         while (written < bytes_to_write) {
             if (stop_requested_.load(std::memory_order_acquire)) return WORK_DONE;
 
+#if !defined(_WIN32)
             pollfd descriptor{ fd_, POLLOUT, 0 };
             const int poll_result = ::poll(&descriptor, 1, 50);
             if (poll_result == 0) {
@@ -485,14 +1080,25 @@ private:
             if ((descriptor.revents & POLLNVAL) != 0) {
                 throw std::runtime_error("output file descriptor became invalid");
             }
+#endif
 
-            const ssize_t bytes =
-                ::write(fd_, input + written, bytes_to_write - written);
+            std::ptrdiff_t bytes = 0;
+            {
+                platform::cancellable_io::operation operation(cancellable_io_);
+                if (stop_requested_.load(std::memory_order_acquire)) {
+                    return WORK_DONE;
+                }
+                bytes = platform::write_fd(
+                    fd_, input + written, bytes_to_write - written);
+            }
             if (bytes > 0) {
                 written += static_cast<std::size_t>(bytes);
                 bytes_written_.fetch_add(static_cast<std::uint64_t>(bytes),
                                          std::memory_order_relaxed);
                 continue;
+            }
+            if (bytes < 0 && stop_requested_.load(std::memory_order_acquire)) {
+                return WORK_DONE;
             }
             if (bytes < 0 && (errno == EINTR || errno == EAGAIN ||
                               errno == EWOULDBLOCK)) {
@@ -506,14 +1112,19 @@ private:
             throw std::runtime_error("write(output) made no progress");
         }
         return static_cast<int>(written / sizeof(gr_complex));
+#endif
     }
 
     int fd_ = -1;
     bool is_stdout_ = false;
     std::size_t max_write_bytes_ = 512;
+    platform::cancellable_io cancellable_io_;
     std::shared_ptr<async_error_state> error_state_;
     std::atomic<bool> stop_requested_{ false };
     std::atomic<std::uint64_t> bytes_written_{ 0 };
+#if defined(_WIN32)
+    std::size_t partial_item_bytes_ = 0;
+#endif
 };
 
 struct Graph {
@@ -523,12 +1134,111 @@ struct Graph {
     interruptible_output_sink::sptr output_sink;
 };
 
+#if defined(_WIN32)
+std::atomic<int> caught_signal{ 0 };
+static_assert(std::atomic<int>::is_always_lock_free,
+              "Windows console control handling requires a lock-free atomic int");
+
+void store_caught_signal(int signal_number) noexcept
+{
+    caught_signal.store(signal_number, std::memory_order_relaxed);
+}
+
+int load_caught_signal() noexcept
+{
+    return caught_signal.load(std::memory_order_relaxed);
+}
+#else
 volatile std::sig_atomic_t caught_signal = 0;
 
-extern "C" void handle_signal(int signal_number)
+void store_caught_signal(int signal_number) noexcept
 {
     caught_signal = signal_number;
 }
+
+int load_caught_signal() noexcept { return caught_signal; }
+#endif
+
+extern "C" void handle_signal(int signal_number)
+{
+    store_caught_signal(signal_number);
+}
+
+#if defined(_WIN32)
+extern "C" BOOL WINAPI handle_console_control(DWORD control_type)
+{
+    switch (control_type) {
+    case CTRL_C_EVENT:
+        store_caught_signal(SIGINT);
+        return TRUE;
+    case CTRL_BREAK_EVENT:
+        store_caught_signal(SIGBREAK);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+#endif
+
+class scoped_signal_handlers
+{
+public:
+    scoped_signal_handlers()
+    {
+        store_caught_signal(0);
+        old_sigint_ = std::signal(SIGINT, handle_signal);
+        old_sigterm_ = std::signal(SIGTERM, handle_signal);
+#if defined(_WIN32)
+        old_sigbreak_ = std::signal(SIGBREAK, handle_signal);
+        if (::SetConsoleCtrlHandler(handle_console_control, TRUE) == 0) {
+            const DWORD error = ::GetLastError();
+            restore_standard_handlers();
+            throw std::system_error(static_cast<int>(error),
+                                    std::system_category(),
+                                    "install Windows console control handler");
+        }
+        console_handler_installed_ = true;
+#else
+        old_sigpipe_ = std::signal(SIGPIPE, SIG_IGN);
+#endif
+    }
+
+    ~scoped_signal_handlers()
+    {
+#if defined(_WIN32)
+        if (console_handler_installed_) {
+            ::SetConsoleCtrlHandler(handle_console_control, FALSE);
+        }
+#endif
+        restore_standard_handlers();
+    }
+
+    scoped_signal_handlers(const scoped_signal_handlers&) = delete;
+    scoped_signal_handlers& operator=(const scoped_signal_handlers&) = delete;
+
+private:
+    using signal_handler = void (*)(int);
+
+    void restore_standard_handlers() noexcept
+    {
+        std::signal(SIGINT, old_sigint_);
+        std::signal(SIGTERM, old_sigterm_);
+#if defined(_WIN32)
+        std::signal(SIGBREAK, old_sigbreak_);
+#else
+        std::signal(SIGPIPE, old_sigpipe_);
+#endif
+    }
+
+    signal_handler old_sigint_ = SIG_DFL;
+    signal_handler old_sigterm_ = SIG_DFL;
+#if defined(_WIN32)
+    signal_handler old_sigbreak_ = SIG_DFL;
+    bool console_handler_installed_ = false;
+#else
+    signal_handler old_sigpipe_ = SIG_DFL;
+#endif
+};
 
 [[noreturn]] void fail(const std::string& message)
 {
@@ -680,19 +1390,16 @@ std::string require_value(int argc, char** argv, int& index)
 
 Options parse_options(int argc, char** argv)
 {
-    const auto handle_meta_option = [](std::string_view arg) {
-        if (arg == "--help") {
+    if (argc == 2) {
+        const std::string_view argument(argv[1]);
+        if (argument == "--help") {
             print_help(std::cout);
             std::exit(0);
         }
-        if (arg == "--version") {
+        if (argument == "--version") {
             std::cout << "dvbt2mod 0.1.0\n";
             std::exit(0);
         }
-    };
-    if (argc == 2) handle_meta_option(argv[1]);
-    for (int i = 3; i < argc; i += 2) {
-        handle_meta_option(argv[i]);
     }
 
     if (argc < 3) {
@@ -1288,7 +1995,8 @@ void validate_input(const Options& options)
     }
 
     std::error_code ec;
-    const fs::file_status status = fs::status(options.input, ec);
+    const fs::path input_path = platform::path_from_utf8(options.input);
+    const fs::file_status status = fs::status(input_path, ec);
     if (ec || !fs::exists(status)) {
         fail("input does not exist: " + options.input);
     }
@@ -1296,7 +2004,7 @@ void validate_input(const Options& options)
         fail("INPUT path must be a regular file; use '-' for a pipe or stream");
     }
 
-    const std::uintmax_t size = fs::file_size(options.input, ec);
+    const std::uintmax_t size = fs::file_size(input_path, ec);
     if (ec || size == 0) {
         fail("input TS is empty or unreadable");
     }
@@ -1304,7 +2012,7 @@ void validate_input(const Options& options)
         fail("input size is not a multiple of 188-byte MPEG-TS packets");
     }
 
-    std::ifstream input(options.input, std::ios::binary);
+    std::ifstream input(input_path, std::ios::binary);
     if (!input) {
         fail("cannot open input: " + options.input);
     }
@@ -1339,33 +2047,30 @@ void validate_output(const Options& options)
     if (options.output == "-") {
         return;
     }
+    const fs::path output_path = platform::path_from_utf8(options.output);
     std::error_code ec;
-    if (fs::exists(options.output, ec)) {
+    if (fs::exists(output_path, ec)) {
         if (!ec) {
-            if (!fs::is_regular_file(options.output, ec) || ec) {
+            if (!fs::is_regular_file(output_path, ec) || ec) {
                 fail("OUTPUT path must be a regular file; use '-' for a pipe or stream");
             }
             if (options.input != "-" &&
-                fs::equivalent(options.input, options.output, ec) && !ec) {
+                fs::equivalent(platform::path_from_utf8(options.input),
+                               output_path,
+                               ec) &&
+                !ec) {
                 fail("INPUT and OUTPUT refer to the same file");
             }
-            if (options.input == "-") {
-                struct stat input_status {};
-                struct stat output_status {};
-                if (::fstat(STDIN_FILENO, &input_status) == 0 &&
-                    ::stat(options.output.c_str(), &output_status) == 0 &&
-                    S_ISREG(input_status.st_mode) &&
-                    input_status.st_dev == output_status.st_dev &&
-                    input_status.st_ino == output_status.st_ino) {
-                    fail("stdin and OUTPUT refer to the same file");
-                }
+            if (options.input == "-" &&
+                platform::stdin_refers_to_file(options.output)) {
+                fail("stdin and OUTPUT refer to the same file");
             }
         }
         if (!options.overwrite) {
             fail("output already exists; pass --overwrite 1 to replace it");
         }
     }
-    const fs::path parent = fs::path(options.output).parent_path();
+    const fs::path parent = output_path.parent_path();
     if (!parent.empty() && !fs::is_directory(parent, ec)) {
         fail("output directory does not exist: " + parent.string());
     }
@@ -1515,7 +2220,10 @@ Graph build_graph(const Options& options)
         graph.top->connect(tail, 0, sink, 0);
     } else {
         graph.output_sink = interruptible_output_sink::make(
-            options.output, options.overwrite, graph.error_state);
+            options.output,
+            options.overwrite,
+            graph.source ? graph.source->file_descriptor() : -1,
+            graph.error_state);
         graph.top->connect(tail, 0, graph.output_sink, 0);
     }
     return graph;
@@ -1539,14 +2247,33 @@ void print_config(const Options& options)
 int execute_flowgraph(const gr::top_block_sptr& top,
                       const std::shared_ptr<async_error_state>& error_state)
 {
-    caught_signal = 0;
-    const auto old_sigint = std::signal(SIGINT, handle_signal);
-    const auto old_sigterm = std::signal(SIGTERM, handle_signal);
-    const auto old_sigpipe = std::signal(SIGPIPE, SIG_IGN);
-
     std::atomic<bool> finished{ false };
     std::exception_ptr wait_error;
     std::thread waiter;
+    const auto join_after_stop = [&] {
+        if (!waiter.joinable()) return;
+#if defined(_WIN32)
+        // Cancellation errors must never turn Ctrl-C or a broken pipe into a
+        // permanently wedged process. Supported pipe/file I/O normally exits
+        // immediately; this is a last-resort process-level safety boundary.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(5);
+        while (!finished.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!finished.load(std::memory_order_acquire)) {
+            const unsigned int exit_code =
+                load_caught_signal() == 0
+                    ? 2U
+                    : 128U + static_cast<unsigned int>(load_caught_signal());
+            ::TerminateProcess(::GetCurrentProcess(), exit_code);
+            std::_Exit(static_cast<int>(exit_code));
+        }
+#endif
+        waiter.join();
+    };
+    bool stop_initiated = false;
     try {
         top->start();
         waiter = std::thread([&] {
@@ -1559,33 +2286,33 @@ int execute_flowgraph(const gr::top_block_sptr& top,
         });
 
         while (!finished.load(std::memory_order_acquire)) {
-            if (caught_signal != 0 || error_state->failed()) {
+            if (load_caught_signal() != 0 || error_state->failed()) {
+                stop_initiated = true;
                 top->stop();
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        waiter.join();
+        if (stop_initiated) {
+            join_after_stop();
+        } else {
+            waiter.join();
+        }
     } catch (...) {
         top->stop();
-        if (waiter.joinable()) waiter.join();
-        std::signal(SIGINT, old_sigint);
-        std::signal(SIGTERM, old_sigterm);
-        std::signal(SIGPIPE, old_sigpipe);
+        join_after_stop();
         throw;
     }
 
-    std::signal(SIGINT, old_sigint);
-    std::signal(SIGTERM, old_sigterm);
-    std::signal(SIGPIPE, old_sigpipe);
     if (wait_error) std::rethrow_exception(wait_error);
     error_state->rethrow_if_failed();
-    return static_cast<int>(caught_signal);
+    return load_caught_signal();
 }
 
 int run(int argc, char** argv)
 {
     const Options options = parse_options(argc, argv);
+    const scoped_signal_handlers signal_handlers;
     const std::uint16_t endian_probe = 1;
     if (*reinterpret_cast<const std::uint8_t*>(&endian_probe) != 1) {
         fail("CF32LE output is supported only on a little-endian host");
@@ -1594,6 +2321,16 @@ int run(int argc, char** argv)
     validate_input(options);
     validate_output(options);
     print_config(options);
+
+    if (options.output == "-") {
+        // Some GNU Radio Windows builds attach their debug console sink to
+        // stdout. That would prepend scheduler messages to the headerless CF32
+        // stream, so reserve stdout exclusively for payload bytes. dvbt2mod's
+        // own diagnostics and errors continue to use stderr.
+        auto& logging = gr::logging::singleton();
+        logging.set_default_level(gr::log_level::off);
+        logging.set_debug_level(gr::log_level::off);
+    }
 
     Graph graph = build_graph(options);
     if (options.check_only) {
@@ -1615,7 +2352,8 @@ int run(int argc, char** argv)
     }
     if (options.output != "-") {
         std::error_code ec;
-        const std::uintmax_t file_bytes = fs::file_size(options.output, ec);
+        const std::uintmax_t file_bytes = fs::file_size(
+            platform::path_from_utf8(options.output), ec);
         if (ec) fail("cannot determine output file size after modulation");
         if (file_bytes != output_bytes)
             fail("output file size does not match bytes written by the sink");
@@ -1658,6 +2396,25 @@ int run(int argc, char** argv)
 
 } // namespace
 
+#if defined(_WIN32)
+int wmain(int argc, wchar_t** wide_argv)
+{
+    try {
+        std::vector<std::string> arguments;
+        arguments.reserve(static_cast<std::size_t>(argc));
+        for (int index = 0; index < argc; ++index) {
+            arguments.push_back(platform::utf8_from_wide(wide_argv[index]));
+        }
+        std::vector<char*> argv;
+        argv.reserve(arguments.size());
+        for (std::string& argument : arguments) argv.push_back(argument.data());
+        return run(argc, argv.data());
+    } catch (const std::exception& error) {
+        std::cerr << "dvbt2mod: error: " << error.what() << '\n';
+        return 2;
+    }
+}
+#else
 int main(int argc, char** argv)
 {
     try {
@@ -1667,3 +2424,4 @@ int main(int argc, char** argv)
         return 2;
     }
 }
+#endif

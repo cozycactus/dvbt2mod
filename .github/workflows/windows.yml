@@ -1,0 +1,361 @@
+name: Windows x64
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: UCRT64 build, test, and package
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+      - name: Preserve LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf input
+
+      - name: Check out source
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install MSYS2 UCRT64 toolchain and GNU Radio
+        # msys2/setup-msys2 v2.32.0
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            curl
+            git
+          pacboy: >-
+            toolchain:p
+            cmake:p
+            ninja:p
+            python:p
+            boost:p
+            gnuradio:p
+            ntldd:p
+
+      - name: Select artifact version and verify dependencies
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          project_version=$(sed -nE \
+            's/^project\(dvbt2mod VERSION ([0-9.]+) LANGUAGES CXX\)$/\1/p' \
+            CMakeLists.txt)
+          if [[ -z "$project_version" ]]; then
+            echo 'Could not read the project version from CMakeLists.txt' >&2
+            exit 1
+          fi
+
+          gnuradio_package=$(pacman -Q mingw-w64-ucrt-x86_64-gnuradio)
+          case "$gnuradio_package" in
+            'mingw-w64-ucrt-x86_64-gnuradio 3.10.12.0-'*) ;;
+            *)
+              echo "Expected GNU Radio 3.10.12.0, found: $gnuradio_package" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            expected_tag="v$project_version"
+            if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+              echo "Tag $GITHUB_REF_NAME does not match project version $expected_tag" >&2
+              exit 1
+            fi
+            artifact_version=$project_version
+          else
+            artifact_version="$project_version-${GITHUB_SHA:0:7}"
+          fi
+          echo "BUNDLE_NAME=dvbt2mod-$artifact_version-windows-x64" >>"$GITHUB_ENV"
+          echo "UCRT64_BIN=$(cygpath -w "$MINGW_PREFIX/bin")" >>"$GITHUB_ENV"
+          printf 'Using %s\n' "$gnuradio_package"
+
+      - name: Configure and build
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build-windows -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DDVBT2MOD_ENABLE_NETWORK_TESTS=ON
+          cmake --build build-windows --parallel
+          strip --strip-unneeded build-windows/dvbt2mod.exe
+
+      - name: Prove raw Windows stdin and stdout pipes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:PATH = "$env:UCRT64_BIN;$env:PATH"
+          $exe = Join-Path $PWD "build-windows/dvbt2mod.exe"
+          $probeExe = Join-Path $PWD "build-windows/dvbt2mod_windows_pipe_probe.exe"
+          $smoke = Join-Path $env:RUNNER_TEMP "dvbt2mod-raw-pipe"
+          New-Item -ItemType Directory -Force -Path $smoke | Out-Null
+
+          # First prove that this exact Process/BaseStream harness is a raw
+          # Win32 byte pipe. The native control writes NUL, LF, CRLF, and 0xff
+          # directly with WriteFile.
+          $probeStart = [Diagnostics.ProcessStartInfo]::new()
+          $probeStart.FileName = $probeExe
+          $probeStart.UseShellExecute = $false
+          $probeStart.CreateNoWindow = $true
+          $probeStart.RedirectStandardOutput = $true
+          $probeStart.RedirectStandardError = $true
+          $probeProcess = [Diagnostics.Process]::new()
+          $probeProcess.StartInfo = $probeStart
+          if (-not $probeProcess.Start()) {
+            throw "could not start Win32 pipe control"
+          }
+          $probeStream = [IO.MemoryStream]::new()
+          $probeTask = $probeProcess.StandardOutput.BaseStream.CopyToAsync($probeStream)
+          $probeErrorTask = $probeProcess.StandardError.ReadToEndAsync()
+          $probeProcess.WaitForExit()
+          $null = $probeTask.GetAwaiter().GetResult()
+          $probeError = $probeErrorTask.GetAwaiter().GetResult()
+          $probeExpected = [byte[]](0x00, 0x41, 0x0a, 0x42, 0x0d, 0x0a, 0x43, 0xff)
+          $probeActual = $probeStream.ToArray()
+          $probeExpectedHash = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($probeExpected)
+          )
+          $probeActualHash = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($probeActual)
+          )
+          if (
+            $probeProcess.ExitCode -ne 0 -or
+            $probeActual.Length -ne $probeExpected.Length -or
+            $probeActualHash -ne $probeExpectedHash
+          ) {
+            throw "Win32 pipe control failed: exit=$($probeProcess.ExitCode), bytes=$($probeActual.Length), hash=$probeActualHash, stderr=$probeError"
+          }
+
+          $input = Join-Path $smoke "input.ts"
+          $expectedPath = Join-Path $smoke "expected.cf32"
+          $packet = [byte[]]::new(188)
+          [Array]::Fill($packet, [byte]0xff)
+          $packet[0] = 0x47
+          $packet[1] = 0x1f
+          $packet[2] = 0xff
+          $packet[3] = 0x10
+          [IO.File]::WriteAllBytes($input, $packet)
+          & $exe $input $expectedPath --profile 0
+          if ($LASTEXITCODE -ne 0) {
+            throw "named-output reference failed with exit code $LASTEXITCODE"
+          }
+
+          $start = [Diagnostics.ProcessStartInfo]::new()
+          $start.FileName = $exe
+          $start.UseShellExecute = $false
+          $start.CreateNoWindow = $true
+          $start.RedirectStandardInput = $true
+          $start.RedirectStandardOutput = $true
+          $start.RedirectStandardError = $true
+          foreach ($argument in @("-", "-", "--profile", "0")) {
+            $start.ArgumentList.Add($argument)
+          }
+          $process = [Diagnostics.Process]::new()
+          $process.StartInfo = $start
+          if (-not $process.Start()) {
+            throw "could not start raw-pipe smoke process"
+          }
+          $actualStream = [IO.MemoryStream]::new()
+          $outputTask = $process.StandardOutput.BaseStream.CopyToAsync($actualStream)
+          $errorTask = $process.StandardError.ReadToEndAsync()
+          $process.StandardInput.BaseStream.Write($packet, 0, $packet.Length)
+          $process.StandardInput.BaseStream.Close()
+          $process.WaitForExit()
+          $null = $outputTask.GetAwaiter().GetResult()
+          $processError = $errorTask.GetAwaiter().GetResult()
+          if ($process.ExitCode -ne 0) {
+            throw "raw-pipe process failed with exit code $($process.ExitCode): $processError"
+          }
+
+          $expected = [IO.File]::ReadAllBytes($expectedPath)
+          $actual = $actualStream.ToArray()
+          $expectedHash = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($expected)
+          )
+          $actualHash = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($actual)
+          )
+          if ($actual.Length -ne 421888 -or $actualHash -ne $expectedHash) {
+            $expectedOffset = 0
+            $actualOffset = 0
+            $insertedCarriageReturns = 0
+            $onlyInsertedCarriageReturns = $true
+            while (
+              $expectedOffset -lt $expected.Length -and
+              $actualOffset -lt $actual.Length
+            ) {
+              if ($actual[$actualOffset] -eq $expected[$expectedOffset]) {
+                $actualOffset++
+                $expectedOffset++
+              } elseif (
+                $actual[$actualOffset] -eq 0x0d -and
+                $actualOffset + 1 -lt $actual.Length -and
+                $actual[$actualOffset + 1] -eq 0x0a -and
+                $expected[$expectedOffset] -eq 0x0a
+              ) {
+                $actualOffset++
+                $insertedCarriageReturns++
+              } else {
+                $onlyInsertedCarriageReturns = $false
+                break
+              }
+            }
+            if (
+              $actualOffset -ne $actual.Length -or
+              $expectedOffset -ne $expected.Length
+            ) {
+              $onlyInsertedCarriageReturns = $false
+            }
+            throw "raw pipe produced $($actual.Length) bytes / $actualHash; expected 421888 / $expectedHash; CR-before-LF-only=$onlyInsertedCarriageReturns inserted=$insertedCarriageReturns mismatch-offset=$expectedOffset"
+          }
+
+      - name: Run native Windows tests
+        shell: msys2 {0}
+        run: |
+          ctest --test-dir build-windows --output-on-failure
+
+      - name: Assemble portable runtime
+        shell: msys2 {0}
+        run: |
+          chmod +x scripts/package_windows.sh
+          scripts/package_windows.sh \
+            build-windows/dvbt2mod.exe \
+            "dist/$BUNDLE_NAME" \
+            "dist/$BUNDLE_NAME-corresponding-source"
+
+      - name: Prove the bundle without MSYS2 on PATH
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = Join-Path $PWD "dist/$env:BUNDLE_NAME"
+          $exe = Join-Path $bundle "dvbt2mod.exe"
+          $smoke = Join-Path $env:RUNNER_TEMP "dvbt2mod-проверка"
+          New-Item -ItemType Directory -Force -Path $smoke | Out-Null
+          $input = Join-Path $smoke "вход.ts"
+          $output = Join-Path $smoke "выход.cf32"
+          $packet = [byte[]]::new(188)
+          [Array]::Fill($packet, [byte]0xff)
+          $packet[0] = 0x47
+          $packet[1] = 0x1f
+          $packet[2] = 0xff
+          $packet[3] = 0x10
+          [IO.File]::WriteAllBytes($input, $packet)
+
+          $savedPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            & $exe --help | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "portable --help failed with exit code $LASTEXITCODE"
+            }
+            & $exe $input $output --profile 0
+            if ($LASTEXITCODE -ne 0) {
+              throw "portable modulation failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            $env:PATH = $savedPath
+          }
+          $actualSize = (Get-Item $output).Length
+          if ($actualSize -ne 421888) {
+            throw "portable smoke output is $actualSize bytes; expected 421888"
+          }
+
+      - name: Create ZIP and checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = Join-Path $PWD "dist/$env:BUNDLE_NAME"
+          $sources = Join-Path $PWD "dist/$env:BUNDLE_NAME-corresponding-source"
+          $archives = @(
+            @{ Source = $bundle; Zip = "$bundle.zip"; Level = "Optimal" },
+            @{ Source = $sources; Zip = "$sources.zip"; Level = "NoCompression" }
+          )
+          foreach ($archive in $archives) {
+            Compress-Archive `
+              -Path $archive.Source `
+              -DestinationPath $archive.Zip `
+              -CompressionLevel $archive.Level
+            $hash = (Get-FileHash -Algorithm SHA256 $archive.Zip).Hash.ToLowerInvariant()
+            $leaf = Split-Path -Leaf $archive.Zip
+            [IO.File]::WriteAllText(
+              "$($archive.Zip).sha256",
+              "$hash  $leaf`n",
+              [Text.Encoding]::ASCII
+            )
+          }
+          Get-Item dist/*.zip, dist/*.zip.sha256 | Format-Table Name, Length
+
+      - name: Verify release archives and portable checksums
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd dist
+          if grep -l $'\r' -- *.zip.sha256; then
+            echo 'Checksum files must use portable LF line endings' >&2
+            exit 1
+          fi
+          sha256sum -c -- *.zip.sha256
+          for archive in *.zip; do
+            bsdtar -tf "$archive" >/dev/null
+          done
+
+      - name: Upload Windows package
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dvbt2mod-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Attach package to GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified Windows package
+        # actions/download-artifact v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: dvbt2mod-windows-x64
+          path: release-assets
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          (cd release-assets && sha256sum -c -- *.zip.sha256)
+          assets=(release-assets/*.zip release-assets/*.zip.sha256)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Refusing to replace immutable release $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --verify-tag \
+            --generate-notes \
+            --title "dvbt2mod $GITHUB_REF_NAME" \
+            "${prerelease[@]}"
