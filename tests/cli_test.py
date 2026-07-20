@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -29,6 +30,135 @@ def checked_run(arguments: list[str], **kwargs: object) -> subprocess.CompletedP
             f"command failed with {result.returncode}: {' '.join(arguments)}\n{stderr}"
         )
     return result
+
+
+def check_interrupts(executable: str, directory: Path, source: Path) -> None:
+    """Exercise interruptible stdin/stdout on POSIX and Windows console groups."""
+    creationflags = 0
+    interrupt_signal = signal.SIGINT
+    expected_returncode = 128 + signal.SIGINT
+    signal_name = "SIGINT"
+    allocated_console = False
+
+    if sys.platform == "win32":
+        # GenerateConsoleCtrlEvent requires caller and child to share a console.
+        # A service-hosted CI process may not have one, so attach a private
+        # console before creating the child's new process group.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetConsoleProcessList.argtypes = [
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.DWORD,
+        ]
+        kernel32.GetConsoleProcessList.restype = wintypes.DWORD
+        kernel32.AllocConsole.restype = wintypes.BOOL
+        kernel32.FreeConsole.restype = wintypes.BOOL
+        process_ids = (wintypes.DWORD * 1)()
+        if kernel32.GetConsoleProcessList(process_ids, 1) == 0:
+            if not kernel32.AllocConsole():
+                error = ctypes.get_last_error()
+                print(
+                    f"SKIP: cannot allocate a console for CTRL_BREAK_EVENT ({error})"
+                )
+                return
+            allocated_console = True
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        interrupt_signal = signal.CTRL_BREAK_EVENT
+        expected_returncode = 128 + signal.SIGBREAK
+        signal_name = "SIGBREAK"
+
+    def interrupt_and_wait(process: subprocess.Popen[bytes], label: str) -> bytes:
+        if process.stderr is None:
+            raise RuntimeError(f"{label} has no stderr readiness stream")
+
+        ready = threading.Event()
+        stderr_bytes = bytearray()
+
+        def drain_stderr() -> None:
+            assert process.stderr is not None
+            for line in iter(process.stderr.readline, b""):
+                stderr_bytes.extend(line)
+                if line.startswith(b"profile="):
+                    ready.set()
+
+        reader = threading.Thread(target=drain_stderr, daemon=True)
+        reader.start()
+
+        if not ready.wait(timeout=10):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+            reader.join(timeout=3)
+            raise RuntimeError(
+                f"{label} did not install its signal handler: "
+                f"{bytes(stderr_bytes).decode(errors='replace')}"
+            )
+
+        # The handler is installed before the profile line. Give graph startup
+        # a short deterministic window so the source/sink reaches blocked I/O.
+        time.sleep(0.5)
+        try:
+            process.send_signal(interrupt_signal)
+            process.wait(timeout=8)
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+            reader.join(timeout=3)
+            raise
+        reader.join(timeout=3)
+        if reader.is_alive():
+            raise RuntimeError(f"{label} stderr reader did not finish")
+        process.stderr.close()
+        if process.returncode != expected_returncode:
+            raise RuntimeError(
+                f"{label} {signal_name} returned {process.returncode}: "
+                f"{bytes(stderr_bytes).decode(errors='replace')}"
+            )
+        return bytes(stderr_bytes)
+
+    try:
+        idle = subprocess.Popen(
+            [
+                executable,
+                "-",
+                str(directory / "idle.cf32"),
+                "--profile",
+                "0",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
+        interrupt_and_wait(idle, "idle-stdin")
+        if idle.stdin:
+            idle.stdin.close()
+
+        blocked = subprocess.Popen(
+            [executable, str(source), "-", "--profile", "0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
+        blocked_log = interrupt_and_wait(blocked, "blocked-stdout")
+        blocked_bytes = blocked.stdout.read() if blocked.stdout else b""
+        summary = re.search(
+            rb"complex_samples=(\d+).*output_bytes=(\d+)", blocked_log
+        )
+        if not summary:
+            raise RuntimeError("blocked-stdout run did not report output counters")
+        reported_samples, reported_bytes = map(int, summary.groups())
+        if (
+            reported_bytes != len(blocked_bytes)
+            or reported_samples != len(blocked_bytes) // 8
+        ):
+            raise RuntimeError("blocked-stdout counters do not match delivered bytes")
+    finally:
+        if allocated_console:
+            kernel32.FreeConsole()
 
 
 def main() -> int:
@@ -52,14 +182,79 @@ def main() -> int:
         if output.stat().st_size != FRAME_BYTES:
             raise RuntimeError("finite-file null padding did not produce one full frame")
 
+        unicode_directory = directory / "кириллица"
+        unicode_directory.mkdir()
+        unicode_source = unicode_directory / "вход.ts"
+        unicode_output = unicode_directory / "выход.cf32"
+        unicode_source.write_bytes(packet)
+        checked_run(
+            [
+                executable,
+                str(unicode_source),
+                str(unicode_output),
+                "--profile",
+                "0",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if unicode_output.stat().st_size != FRAME_BYTES:
+            raise RuntimeError("Unicode input/output paths produced a truncated frame")
+
+        with unicode_output.open("ab") as existing_output:
+            existing_output.write(b"STALE-TAIL")
+        checked_run(
+            [
+                executable,
+                str(unicode_source),
+                str(unicode_output),
+                "--profile",
+                "0",
+                "--overwrite",
+                "1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if unicode_output.stat().st_size != FRAME_BYTES:
+            raise RuntimeError("overwrite did not truncate the Unicode output safely")
+
+        unicode_before = hashlib.sha256(unicode_source.read_bytes()).digest()
+        with unicode_source.open("rb") as stdin:
+            unicode_same = subprocess.run(
+                [
+                    executable,
+                    "-",
+                    str(unicode_source),
+                    "--profile",
+                    "0",
+                    "--overwrite",
+                    "1",
+                ],
+                stdin=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        if (
+            unicode_same.returncode == 0
+            or hashlib.sha256(unicode_source.read_bytes()).digest() != unicode_before
+        ):
+            raise RuntimeError("Unicode stdin/output same-file protection failed")
+
         piped = checked_run(
             [executable, "-", "-", "--profile", "0"],
             input=packet,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        if len(piped.stdout) != FRAME_BYTES:
-            raise RuntimeError("stdin/stdout conversion did not produce one full frame")
+        expected_stream = output.read_bytes()
+        if piped.stdout != expected_stream:
+            raise RuntimeError(
+                "stdin/stdout conversion produced "
+                f"{len(piped.stdout)} bytes, expected {FRAME_BYTES}; "
+                f"stderr={piped.stderr.decode(errors='replace')!r}"
+            )
 
         malformed = directory / "malformed.ts"
         packets = bytearray(packet * 200)
@@ -116,48 +311,7 @@ def main() -> int:
         if same.returncode == 0 or hashlib.sha256(source.read_bytes()).digest() != before:
             raise RuntimeError("stdin/output same-file protection failed")
 
-        idle = subprocess.Popen(
-            [
-                executable,
-                "-",
-                str(directory / "idle.cf32"),
-                "--profile",
-                "0",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        time.sleep(0.15)
-        idle.send_signal(signal.SIGINT)
-        idle.wait(timeout=3)
-        if idle.returncode != 128 + signal.SIGINT:
-            raise RuntimeError(f"idle-stdin SIGINT returned {idle.returncode}")
-        if idle.stdin:
-            idle.stdin.close()
-        if idle.stderr:
-            idle.stderr.close()
-
-        blocked = subprocess.Popen(
-            [executable, str(source), "-", "--profile", "0"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        time.sleep(0.15)
-        blocked.send_signal(signal.SIGINT)
-        blocked.wait(timeout=3)
-        if blocked.returncode != 128 + signal.SIGINT:
-            raise RuntimeError(f"blocked-stdout SIGINT returned {blocked.returncode}")
-        blocked_bytes = blocked.stdout.read() if blocked.stdout else b""
-        blocked_log = blocked.stderr.read() if blocked.stderr else b""
-        summary = re.search(
-            rb"complex_samples=(\d+).*output_bytes=(\d+)", blocked_log
-        )
-        if not summary:
-            raise RuntimeError("blocked-stdout run did not report output counters")
-        reported_samples, reported_bytes = map(int, summary.groups())
-        if reported_bytes != len(blocked_bytes) or reported_samples != len(blocked_bytes) // 8:
-            raise RuntimeError("blocked-stdout counters do not match delivered bytes")
+        check_interrupts(executable, directory, source)
 
         broken = subprocess.Popen(
             [executable, str(source), "-", "--profile", "0"],

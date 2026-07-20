@@ -33,6 +33,16 @@ unset(DVBT2MOD_HAD_ENABLE_PYTHON_CACHE)
 unset(DVBT2MOD_SAVED_ENABLE_PYTHON)
 
 add_executable(dvbt2mod src/main.cpp)
+if(WIN32)
+  target_compile_definitions(
+    dvbt2mod
+    PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601
+  )
+endif()
+if(MINGW)
+  # Select MinGW's wide-character console startup for wmain().
+  target_link_options(dvbt2mod PRIVATE -municode)
+endif()
 target_link_libraries(
   dvbt2mod
   PRIVATE
@@ -61,6 +71,20 @@ install(
 
 include(CTest)
 if(BUILD_TESTING)
+  if(WIN32)
+    # A tiny native control used by the Windows workflow to prove that its
+    # Process/BaseStream harness observes anonymous-pipe bytes without text
+    # conversion. It is never installed or included in release archives.
+    add_executable(
+      dvbt2mod_windows_pipe_probe
+      tests/windows_pipe_probe.cpp
+    )
+    target_compile_definitions(
+      dvbt2mod_windows_pipe_probe
+      PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601
+    )
+  endif()
+
   add_test(NAME dvbt2mod_help COMMAND dvbt2mod --help)
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
